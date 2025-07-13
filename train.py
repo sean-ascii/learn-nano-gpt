@@ -183,9 +183,11 @@ class GPT(nn.Module):
 import tiktoken
 
 class DataLoaderLite:
-  def __init__(self, B, T):
+  def __init__(self, B, T, process_rank, num_processes):
     self.B = B
     self.T = T
+    self.process_rank = process_rank
+    self.num_processes = num_processes
 
     # at init load tokens from disk and store them in memory
     with open('input.txt', 'r') as f:
@@ -197,7 +199,7 @@ class DataLoaderLite:
     print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
     # state
-    self.current_position = 0
+    self.current_position = self.B * self.T * self.process_rank
 
   def next_batch(self):
     B, T = self.B, self.T
@@ -205,35 +207,68 @@ class DataLoaderLite:
     x = (buf[:-1]).view(B, T) # inputs
     y = (buf[1:]).view(B, T) # targets
     # advance the position in the tensor
-    self.current_position += B * T
-    if (self.current_position + (B * T + 1) > len(self.tokens)):
-      self.current_position = 0
+    self.current_position += B * T * self.num_processes
+    if (self.current_position + (B * T * self.num_processes + 1) > len(self.tokens)):
+      self.current_position = self.B * self.T * self.process_rank
     return x, y
 
 # -------------------------------------------------------------------------------
+# simple launch:
+# python train.py
+# DDP launch for e.g. 8 GPUs:
+# torchrun --standalone --nproc_per_node=8 train.py
 import time
 
-# attempt to autodetect the device
-device = 'cpu'
-if torch.cuda.is_available():
-  device = 'cuda'
-elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-  device = 'mps'
-# device = 'cpu'
-print(f"using device: {device}")
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+import os
+
+# set up DDP (distributed data parallel)
+# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1
+if ddp:
+  # use of DDP at demands CUDA, we set the device appropriately according to rank
+  assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+  init_process_group(backend='nccl')
+  ddp_rank = int(os.environ['RANK'])
+  ddp_local_rank = int(os.environ['LOCAL_RANK'])
+  ddp_world_size = int(os.environ['WORLD_SIZE'])
+  device = f'cuda:{ddp_local_rank}'
+  torch.cuda.set_device(device)
+  master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+  print(f"ddp_rank: {ddp_rank}, ddp_local_rank: {ddp_local_rank}, ddp_world_size: {ddp_world_size}")
+else:
+  # vanilla, non-DDP run
+  ddp_rank = 0
+  ddp_local_rank = 0
+  ddp_world_size = 1
+  master_process = True
+  # attempt to autodetect the device
+  device = 'cpu'
+  if torch.cuda.is_available():
+    device = 'cuda'
+  elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    device = 'mps'
+  # device = 'cpu'
+  print(f"using device: {device}")
+
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
   torch.cuda.manual_seed(1337)
 
-train_loader = DataLoaderLite(B=8, T=1024)
+train_loader = DataLoaderLite(B=8, T=1024, process_rank=ddp_rank, num_processes=ddp_world_size)
 
 torch.set_float32_matmul_precision('high')
 
-# get logits
+# create model
 model = GPT(GPTConfig())
 model.to(device)
 model = torch.compile(model)
+if ddp:
+  model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for step in range(50):
@@ -241,17 +276,25 @@ for step in range(50):
   x, y = train_loader.next_batch()
   x, y = x.to(device), y.to(device)
   optimizer.zero_grad()
+  loss_accum = 0.0
   with torch.autocast(device_type=device, dtype=torch.bfloat16):
     logits, loss = model(x, y)
     # import code; code.interact(local=locals())
+  loss_accum += loss.detach()
   loss.backward()
+  if ddp:
+    dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
   norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
   optimizer.step()
   torch.cuda.synchronize()
   t1 = time.time()
   dt = (t1 - t0)*1000 # time diff in milliseconds
-  tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-  print(f"step: {step}, loss: {loss.item():.6f}, norm: {norm:.4f}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
+  tokens_per_sec = (train_loader.B * train_loader.T * ddp_world_size) / (t1 - t0)
+  if master_process:
+    print(f"step: {step}, loss: {loss_accum.item():.6f}, norm: {norm:.4f}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
+
+if ddp:
+  destroy_process_group()
 
 import sys; sys.exit(0)
 
